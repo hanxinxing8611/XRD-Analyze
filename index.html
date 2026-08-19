@@ -6221,8 +6221,6 @@ function calculateWilliamsonHall(fwhmResults) {
   const coef = linearLeastSquares(X, pts.map(p => p.y));
   if (!coef) return null;
   const slope = coef[0], intercept = coef[1];
-  const size = intercept > 1e-10 ? (0.89 * 0.15406 / intercept) : null;
-  const strain = Math.abs(slope);
   const ymean = pts.reduce((s, p) => s + p.y, 0) / pts.length;
   let ssTot = 0, ssRes = 0;
   for (const p of pts) {
@@ -6231,8 +6229,22 @@ function calculateWilliamsonHall(fwhmResults) {
     ssRes += (p.y - pred) ** 2;
   }
   const r2 = ssTot > 0 ? Math.max(0, 1 - ssRes / ssTot) : 0;
-  return { sizeNm: size, strain, r2, n: pts.length, corrected: false, points: pts };
+  // M2: W-H 结果可靠性判定——截距>0、斜率>0、R²≥0.80 才报告（不再取 |slope|）
+  const validWH = intercept > 1e-10 && slope > 0 && r2 >= 0.80;
+  return {
+    sizeNm: validWH ? (0.89 * 0.15406 / intercept) : null,
+    strain: validWH ? slope : null,
+    slope: slope,
+    intercept: intercept,
+    r2: r2,
+    n: pts.length,
+    corrected: false,
+    valid: validWH,
+    points: pts
+  };
 }
+
+
 function getProductCrystalSystem(productKey) {
   const map = { 'MAPB': 'cubic', 'MAPI': 'tetragonal', 'FAPB': 'cubic', 'CPBX': 'orthorhombic', 'CPIX': 'orthorhombic', 'FAPI-ALPHA': 'cubic', 'FAPI-DELTA': 'hexagonal', 'C60': 'cubic' };
   return map[productKey] || 'cubic';
@@ -6243,11 +6255,19 @@ function renderWilliamsonHall(wh) {
   const badge = document.getElementById('whBadge');
   const table = document.getElementById('whTable');
   if (!section || !badge || !table) return;
-  if (!wh || !wh.sizeNm) { section.style.display = 'none'; return; }
+  if (!wh) { section.style.display = 'none'; return; }
   section.style.display = 'block';
+  // M2: 拟合不可靠时明确提示，不隐藏
+  if (!wh.valid) {
+    badge.textContent = '拟合不可靠';
+    table.innerHTML = '<tr><td>-</td><td>-</td><td>' + wh.r2.toFixed(3) + '</td><td>' + wh.n + '</td><td>W-H拟合不可靠（slope=' + wh.slope.toExponential(3) + '），不建议报告微应变</td></tr>';
+    return;
+  }
   badge.textContent = wh.sizeNm.toFixed(1) + ' nm';
-  table.innerHTML = '<tr><td>' + wh.sizeNm.toFixed(1) + '</td><td>' + wh.strain.toFixed(5) + '</td><td>' + wh.r2.toFixed(3) + '</td><td>' + wh.n + '</td><td>' + (wh.corrected ? '已扣仪器展宽' : '未扣仪器展宽') + '</td></tr>';
+  table.innerHTML = '<tr><td>' + wh.sizeNm.toFixed(1) + '</td><td>' + wh.strain.toExponential(3) + '</td><td>' + wh.r2.toFixed(3) + '</td><td>' + wh.n + '</td><td>' + (wh.corrected ? '已扣仪器展宽' : '未扣仪器展宽') + '</td></tr>';
 }
+
+
 
 function runComprehensiveAnalysis() {
   if (!sampleDataList[0]?.data || !standardData) return;
@@ -6287,17 +6307,18 @@ function runComprehensiveAnalysis() {
       fitMethod = prof.method;
     } else {
       fwhm = calculateFWHM(data, stdPeak.twoTheta);
-      if (fwhm) fwhm.method = '半高法';
+      if (fwhm) { fwhm.method = '半高法'; samplePeakTheta = fwhm.apexTwoTheta || stdPeak.twoTheta; } // M1: 半高法用实测峰顶
     }
-    const area = integratePeakArea(areaData, stdPeak.twoTheta, 1.0);
+    const area = integratePeakArea(areaData, samplePeakTheta, 1.0); // M1: 峰面积以实测峰位为中心
     let size = null;
     if (fwhm && fwhm.fwhm > 0.01) {
-      size = calculateCrystalliteSize(fwhm.fwhmRad, stdPeak.twoTheta * Math.PI / 180);
+      size = calculateCrystalliteSize(fwhm.fwhmRad, samplePeakTheta * Math.PI / 180); // M1: Scherrer 用实测峰位
     }
 
     const result = {
       index: i + 1,
-      twoTheta: stdPeak.twoTheta,
+      standardTwoTheta: stdPeak.twoTheta, // M1: 保留标准峰位作偏移参考
+      twoTheta: samplePeakTheta,          // M1: 表格/计算用实测峰位
       fwhm: fwhm,
       area: area,
       size: size,
@@ -6420,10 +6441,15 @@ function renderFWHMTable(results) {
   const badge = document.getElementById('avgCrystalliteSize');
   table.innerHTML = '';
 
-  const validSizes = results.filter(r => r.size && r.size.sizeNm > 0 && r.size.sizeNm < 1000);
+  // M3: 仅统计 Pseudo-Voigt 拟合且 R²≥0.90 的峰；用中位数（抗单峰异常拉高）
+  const validSizes = results.filter(r => r.size && r.size.sizeNm > 0 && r.size.sizeNm < 1000 && r.fwhm && r.fwhm.method === 'Pseudo-Voigt拟合' && r.fwhm.r2 >= 0.90);
   if (validSizes.length > 0) {
-    const avgSize = validSizes.reduce((s, r) => s + r.size.sizeNm, 0) / validSizes.length;
-    badge.textContent = `平均 ${avgSize.toFixed(1)} nm`;
+    const sizes = validSizes.map(r => r.size.sizeNm).sort((a, b) => a - b);
+    const mid = Math.floor(sizes.length / 2);
+    const medianSize = sizes.length % 2 === 0 ? (sizes[mid - 1] + sizes[mid]) / 2 : sizes[mid];
+    badge.textContent = `中位 ${medianSize.toFixed(1)} nm（${sizes.length}峰）`;
+  } else {
+    badge.textContent = '-';
   }
 
   results.forEach(r => {
